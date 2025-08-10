@@ -82,16 +82,17 @@ python client_example.py
 ### Core Components
 - **FastAPI Server** (`main.py`): REST API with async processing
 - **VideoProcessor** (`video_processor.py`): Main video analysis pipeline
-- **YOLO Integration**: Object detection for players and basketball
+- **YOLO11 Medium Model**: High-accuracy object detection for players and basketball
+- **DeepSORT Tracking**: Advanced multi-object tracking with appearance-based re-identification
 - **Homography Transformation**: Court view normalization using manual court points
 
 ### Processing Pipeline
-1. **Video Upload**: Accept 1080p 30fps MP4 files
-2. **Object Detection**: YOLO-based detection of players and basketball
-3. **Multi-Object Tracking**: Track players across frames with simple distance-based ID assignment
+1. **Video Upload**: Accept 1080p 30fps MP4 files from dual cameras
+2. **Object Detection**: YOLO11 medium model detection of players and basketball  
+3. **DeepSORT Tracking**: Advanced tracking with appearance-based re-identification
 4. **Court Transformation**: Apply homography using manually provided court boundary points
-5. **Event Recognition**: Detect 2-point shots, 3-point shots, and assists
-6. **Output Generation**: Create annotated video and structured JSON analysis
+5. **Event Recognition**: Detect 2-point shots, 3-point shots, and assists with stable player IDs
+6. **Output Generation**: Create annotated video, BEV video, and structured JSON analysis
 
 ### API Endpoints
 - `POST /upload`: Upload video with optional court boundary points

@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 from ultralytics import YOLO
 import logging
+from deepsort_tracker import BasketballDeepSortTracker
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -40,18 +41,23 @@ class VideoProcessor:
         self.output_dir.mkdir(exist_ok=True)
         
         # Initialize YOLO model using latest ultralytics approach
-        # Use YOLO11 nano model which is the current recommended version
+        # Use YOLO11 medium model for better accuracy
         try:
-            self.model = YOLO('yolo11n.pt')  # YOLO11 nano - latest version
-            logger.info("Loaded YOLO11 nano model successfully")
+            self.model = YOLO('yolo11m.pt')  # YOLO11 medium - better accuracy
+            logger.info("Loaded YOLO11 medium model successfully")
         except Exception as e:
-            logger.warning(f"Failed to load YOLO11, trying YOLOv8: {e}")
+            logger.warning(f"Failed to load YOLO11 medium, trying smaller models: {e}")
             try:
-                self.model = YOLO('yolov8n.pt')  # Fallback to YOLOv8
-                logger.info("Loaded YOLOv8 nano model successfully")
+                self.model = YOLO('yolo11s.pt')  # Fallback to small
+                logger.info("Loaded YOLO11 small model successfully")
             except Exception as e2:
-                logger.error(f"Failed to load any YOLO model: {e2}")
-                raise ValueError("Could not initialize YOLO model")
+                logger.warning(f"Failed to load YOLO11 small, trying YOLOv8: {e2}")
+                try:
+                    self.model = YOLO('yolov8m.pt')  # YOLOv8 medium fallback
+                    logger.info("Loaded YOLOv8 medium model successfully")
+                except Exception as e3:
+                    logger.error(f"Failed to load any YOLO model: {e3}")
+                    raise ValueError("Could not initialize YOLO model")
         
         # Basketball court dimensions (in feet, will convert to meters)
         self.court_length = 94  # feet
@@ -59,13 +65,16 @@ class VideoProcessor:
         
         # Event tracking
         self.events: List[BasketballEvent] = []
-        self.player_tracks = {}
         self.ball_tracks = {}
         self.last_ball_position = None
         self.possession_player = None
         
         # Court transformation matrix
         self.homography_matrix = None
+        
+        # Initialize DeepSORT trackers for both cameras
+        self.tracker_camera1 = BasketballDeepSortTracker(max_age=30, n_init=3)
+        self.tracker_camera2 = BasketballDeepSortTracker(max_age=30, n_init=3)
         
     async def process_dual_videos(self, video1_path: str, video2_path: str, court_points: dict = None) -> Tuple[str, str]:
         """Main dual camera video processing pipeline with BEV transformation."""
@@ -185,31 +194,55 @@ class VideoProcessor:
             raise
     
     async def _process_frame(self, frame: np.ndarray, frame_number: int, fps: int, camera_id: int = 1) -> np.ndarray:
-        """Process a single frame for object detection and tracking."""
+        """Process a single frame for object detection and tracking with DeepSORT."""
         
         timestamp = frame_number / fps
         
         # Run YOLO detection
         results = self.model(frame, verbose=False)
         
-        # Process detections
+        # Convert YOLO results to detection format for DeepSORT
+        detections = []
         for result in results:
             boxes = result.boxes
             if boxes is not None:
                 for box in boxes:
-                    # Get detection info
                     conf = float(box.conf[0])
                     cls = int(box.cls[0])
                     class_name = self.model.names[cls]
                     
-                    # Only process people and sports ball
-                    if class_name == 'person' and conf > 0.5:
-                        self._track_player(box, frame_number, timestamp)
-                    elif class_name == 'sports ball' and conf > 0.3:
-                        self._track_ball(box, frame_number, timestamp)
+                    # Filter detections by confidence
+                    if (class_name == 'person' and conf > 0.5) or (class_name == 'sports ball' and conf > 0.3):
+                        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                        
+                        detections.append({
+                            'bbox': [x1, y1, x2, y2],
+                            'confidence': conf,
+                            'class_id': cls,
+                            'class_name': class_name
+                        })
         
-        # Annotate frame
-        annotated_frame = self._annotate_frame(frame, results, frame_number, timestamp)
+        # Update DeepSORT tracker
+        tracker = self.tracker_camera1 if camera_id == 1 else self.tracker_camera2
+        tracked_objects = tracker.update_tracks(detections, frame, frame_number, timestamp, camera_id)
+        
+        # Process tracked objects for basketball events
+        for obj in tracked_objects:
+            if obj['class_name'] == 'person':
+                center_x, center_y = obj['center']
+                self._check_basketball_events_deepsort(
+                    obj['player_id'], center_x, center_y, timestamp, frame_number
+                )
+            elif obj['class_name'] == 'sports ball':
+                center_x, center_y = obj['center']
+                self._track_ball_deepsort(center_x, center_y, frame_number, timestamp)
+        
+        # Annotate frame with DeepSORT tracking
+        annotated_frame = tracker.visualize_tracks(frame, tracked_objects)
+        
+        # Add timestamp
+        cv2.putText(annotated_frame, f'Camera {camera_id} - Time: {timestamp:.2f}s', 
+                   (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         
         return annotated_frame
     
@@ -345,6 +378,32 @@ class VideoProcessor:
             
             self.possession_player = closest_player
     
+    def _compile_all_player_tracks(self) -> Dict:
+        """Compile player tracks from both DeepSORT trackers."""
+        all_tracks = {}
+        
+        # Combine tracks from both cameras
+        for tracker in [self.tracker_camera1, self.tracker_camera2]:
+            for player_id, tracks in tracker.player_tracks.items():
+                if tracks:
+                    all_tracks[player_id] = {
+                        "total_detections": len(tracks),
+                        "first_appearance": tracks[0]["timestamp"] if tracks else None,
+                        "last_appearance": tracks[-1]["timestamp"] if tracks else None,
+                        "track_id": tracks[0].get("track_id", "unknown") if tracks else "unknown",
+                        "positions": [
+                            {
+                                "timestamp": track["timestamp"],
+                                "frame": track["frame"],
+                                "position": track["position"],
+                                "confidence": track.get("confidence", 0.0)
+                            }
+                            for track in tracks[::30]  # Sample every 30 frames
+                        ]
+                    }
+        
+        return all_tracks
+    
     def _annotate_frame(self, frame: np.ndarray, results, frame_number: int, timestamp: float) -> np.ndarray:
         """Add annotations to frame."""
         
@@ -452,24 +511,9 @@ class VideoProcessor:
                 "processing_timestamp": datetime.now().isoformat()
             },
             "events": [event.to_dict() for event in self.events],
-            "player_tracks": {
-                player_id: {
-                    "total_detections": len(tracks),
-                    "first_appearance": tracks[0]["timestamp"] if tracks else None,
-                    "last_appearance": tracks[-1]["timestamp"] if tracks else None,
-                    "positions": [
-                        {
-                            "timestamp": track["timestamp"],
-                            "frame": track["frame"],
-                            "position": track["position"]
-                        }
-                        for track in tracks[::30]  # Sample every 30 frames
-                    ]
-                }
-                for player_id, tracks in self.player_tracks.items()
-            },
+            "player_tracks": self._compile_all_player_tracks(),
             "statistics": {
-                "total_players_detected": len(self.player_tracks),
+                "total_players_detected": len(self._compile_all_player_tracks()),
                 "total_events": len(self.events),
                 "event_breakdown": self._get_event_breakdown()
             }
@@ -667,3 +711,114 @@ class VideoProcessor:
             pass
         
         return None
+    
+    def _check_basketball_events_deepsort(self, player_id: str, x: float, y: float, 
+                                         timestamp: float, frame_number: int):
+        """Check for basketball events using DeepSORT tracked player IDs."""
+        
+        if not self.last_ball_position:
+            return
+        
+        ball_x, ball_y = self.last_ball_position
+        distance_to_ball = np.sqrt((x - ball_x)**2 + (y - ball_y)**2)
+        
+        # If player is close to ball, they likely have possession
+        if distance_to_ball < 50:
+            self.possession_player = player_id
+        
+        # Simple shot detection based on ball trajectory and court position
+        if self.homography_matrix is not None:
+            court_pos = self._transform_to_court_coordinates(x, y)
+            if court_pos:
+                court_x, court_y = court_pos
+                
+                # Check if near 3-point line or 2-point area
+                if self._is_three_point_shot(court_x, court_y):
+                    event = BasketballEvent(
+                        "3_point_attempt", timestamp, frame_number,
+                        player_id, (x, y), 0.7
+                    )
+                    self.events.append(event)
+                elif self._is_two_point_shot(court_x, court_y):
+                    event = BasketballEvent(
+                        "2_point_attempt", timestamp, frame_number,
+                        player_id, (x, y), 0.6
+                    )
+                    self.events.append(event)
+    
+    def _track_ball_deepsort(self, ball_x: float, ball_y: float, 
+                            frame_number: int, timestamp: float):
+        """Track basketball movement with DeepSORT integration."""
+        
+        # Update ball track
+        self.ball_tracks[frame_number] = {
+            'timestamp': timestamp,
+            'position': (ball_x, ball_y),
+            'bbox': None  # Will be filled if needed
+        }
+        
+        self.last_ball_position = (ball_x, ball_y)
+        
+        # Detect possession changes
+        self._detect_possession_change_deepsort(ball_x, ball_y, timestamp, frame_number)
+    
+    def _detect_possession_change_deepsort(self, ball_x: float, ball_y: float, 
+                                          timestamp: float, frame_number: int):
+        """Detect ball possession changes using DeepSORT tracked players."""
+        
+        # Find closest tracked player to ball from both cameras
+        min_distance = float('inf')
+        closest_player = None
+        
+        # Check players from both cameras
+        for tracker in [self.tracker_camera1, self.tracker_camera2]:
+            for player_id, tracks in tracker.player_tracks.items():
+                if tracks:
+                    last_track = tracks[-1]
+                    if last_track['frame'] >= frame_number - 5:  # Recent track
+                        px, py = last_track['position']
+                        distance = np.sqrt((ball_x - px)**2 + (ball_y - py)**2)
+                        
+                        if distance < min_distance:
+                            min_distance = distance
+                            closest_player = player_id
+        
+        # Check for possession change
+        if (closest_player and closest_player != self.possession_player 
+            and min_distance < 50):
+            
+            # Record assist if previous player passed the ball
+            if self.possession_player:
+                assist_event = BasketballEvent(
+                    "assist", timestamp, frame_number,
+                    self.possession_player, (ball_x, ball_y), 0.5
+                )
+                self.events.append(assist_event)
+            
+            self.possession_player = closest_player
+    
+    def _compile_all_player_tracks(self) -> Dict:
+        """Compile player tracks from both DeepSORT trackers."""
+        all_tracks = {}
+        
+        # Combine tracks from both cameras
+        for tracker in [self.tracker_camera1, self.tracker_camera2]:
+            for player_id, tracks in tracker.player_tracks.items():
+                if tracks:
+                    all_tracks[player_id] = {
+                        "total_detections": len(tracks),
+                        "first_appearance": tracks[0]["timestamp"] if tracks else None,
+                        "last_appearance": tracks[-1]["timestamp"] if tracks else None,
+                        "track_id": tracks[0].get("track_id", "unknown") if tracks else "unknown",
+                        "positions": [
+                            {
+                                "timestamp": track["timestamp"],
+                                "frame": track["frame"],
+                                "position": track["position"],
+                                "confidence": track.get("confidence", 0.0)
+                            }
+                            for track in tracks[::30]  # Sample every 30 frames
+                        ]
+                    }
+        
+        return all_tracks

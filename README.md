@@ -6,7 +6,7 @@ A FastAPI-based system for analyzing basketball videos from dual camera angles, 
 
 - **Dual Camera Processing**: Upload videos from two camera angles simultaneously
 - **Bird's Eye View Generation**: Transform dual camera feeds into a top-down court view
-- **Player & Ball Tracking**: YOLO-based detection and tracking across frames
+- **Advanced Player Tracking**: DeepSORT algorithm with appearance-based re-identification
 - **Basketball Event Recognition**: Detect 2-point shots, 3-point shots, and assists
 - **Multiple Output Formats**: 
   - Side-by-side annotated video (both cameras)
@@ -21,11 +21,12 @@ A FastAPI-based system for analyzing basketball videos from dual camera angles, 
 
 ```bash
 # Clone the repository
-git clone <repository-url>
+git clone https://github.com/rohitmk523/trackingStudio.git
 cd trackingStudio
 
-# Install dependencies
+# Install dependencies (upgrade ultralytics for DeepSORT compatibility)
 pip install -r requirements.txt
+pip install --upgrade ultralytics
 ```
 
 ### 2. Start the Server
@@ -39,26 +40,44 @@ The API will be available at:
 - **API Documentation**: http://localhost:8000/docs
 - **Interactive Testing**: http://localhost:8000/docs
 
-### 3. Upload Videos
+### 3. Prepare Your Videos
 
-#### Using the Web Interface
-1. Go to http://localhost:8000/docs
-2. Find the `/upload` endpoint
-3. Upload your two basketball video files
-4. Optionally provide court boundary points for better accuracy
-
-#### Using Python Client
-```python
-python client_example.py
+Place your basketball videos in the `uploads/` directory:
+```bash
+# Your videos should be in uploads/ folder
+uploads/
+├── camera1.mp4  # First camera angle
+├── camera2.mp4  # Second camera angle
 ```
 
-#### Using curl
+### 4. Upload and Process Videos
+
+#### Option A: Using curl (Recommended)
 ```bash
+# With court boundary points for better accuracy
 curl -X POST "http://localhost:8000/upload" \
-  -F "video1=@camera1.mp4" \
-  -F "video2=@camera2.mp4" \
-  -F "court_points_1={\"corners\": [[100,100], [1800,100], [1800,900], [100,900]]}" \
+  -F "video1=@uploads/camera1.mp4;type=video/mp4" \
+  -F "video2=@uploads/camera2.mp4;type=video/mp4" \
+  -F "court_points_1={\"corners\": [[245,185], [1675,185], [1890,895], [30,895]]}" \
   -F "court_points_2={\"corners\": [[150,120], [1750,150], [1700,950], [120,920]]}"
+
+# Or without court points (less accurate BEV)
+curl -X POST "http://localhost:8000/upload" \
+  -F "video1=@uploads/camera1.mp4;type=video/mp4" \
+  -F "video2=@uploads/camera2.mp4;type=video/mp4"
+```
+
+#### Option B: Using the Web Interface
+1. Go to http://localhost:8000/docs
+2. Find the `/upload` POST endpoint
+3. Click "Try it out"
+4. Upload your two basketball video files from the uploads/ folder
+5. Optionally provide court boundary points JSON
+
+#### Option C: Using Python Client
+```bash
+# Update video paths in client_example.py first, then:
+python client_example.py
 ```
 
 ## 📋 API Usage
@@ -77,22 +96,26 @@ Upload two basketball videos from different camera angles.
 **Response:**
 ```json
 {
-  "job_id": "uuid-string",
-  "status": "queued",
+  "job_id": "99700c75-980b-438a-a33e-f49bf16d126a",
+  "status": "queued", 
   "message": "Videos uploaded successfully. Processing started."
 }
 ```
 
-### 2. Check Processing Status
-**GET** `/status/{job_id}`
+### 5. Monitor Processing Status
+
+Check processing status using the job_id from upload response:
+```bash
+curl "http://localhost:8000/status/99700c75-980b-438a-a33e-f49bf16d126a"
+```
 
 **Response:**
 ```json
 {
-  "job_id": "uuid-string",
+  "job_id": "99700c75-980b-438a-a33e-f49bf16d126a",
   "status": "processing",
-  "progress": 45.2,
-  "message": "Processed 1350/3000 dual camera frames...",
+  "progress": 69.6,
+  "message": "Processed 1470/1813 dual camera frames...",
   "output_video_path": null,
   "output_json_path": null
 }
@@ -100,9 +123,21 @@ Upload two basketball videos from different camera angles.
 
 Status values: `queued`, `processing`, `completed`, `failed`
 
-### 3. Download Results
-**GET** `/download/video/{job_id}` - Download annotated video
-**GET** `/download/json/{job_id}` - Download analysis JSON
+### 6. Download Results
+
+Once status shows `"completed"`, download your results:
+
+```bash
+# Download annotated video (side-by-side + BEV)
+curl -O "http://localhost:8000/download/video/99700c75-980b-438a-a33e-f49bf16d126a"
+
+# Download analysis JSON
+curl -O "http://localhost:8000/download/json/99700c75-980b-438a-a33e-f49bf16d126a"
+```
+
+You'll get:
+- **Large video file** (~260MB): Side-by-side cameras + Bird's Eye View
+- **Analysis JSON** (~144KB): Structured data for AI analysis
 
 ## 🎬 Video Requirements
 
@@ -166,13 +201,14 @@ For accurate Bird's Eye View transformation, provide court boundary points for e
 - Timestamp overlay
 
 ### 2. Bird's Eye View Video (`bev_video.mp4`)
-- Top-down basketball court visualization
+- Top-down basketball court visualization  
 - Player positions from both cameras merged
 - Basketball court lines and markings
 - Color-coded players by camera source
+- **DeepSORT tracking trails** showing player movement history
 
 ### 3. Analysis JSON (`analysis.json`)
-Structure optimized for AI analysis:
+Structure optimized for AI analysis with **enhanced DeepSORT tracking data**:
 
 ```json
 {
@@ -193,11 +229,19 @@ Structure optimized for AI analysis:
     }
   ],
   "player_tracks": {
-    "Player_1": {
-      "total_detections": 150,
-      "first_appearance": 0.5,
-      "last_appearance": 299.8,
-      "positions": [...]
+    "Player_1_42": {
+      "total_detections": 245,
+      "track_id": 42,
+      "first_appearance": 1.5,
+      "last_appearance": 298.7,
+      "positions": [
+        {
+          "timestamp": 1.5,
+          "frame": 45,
+          "position": [640, 360],
+          "confidence": 0.89
+        }
+      ]
     }
   },
   "statistics": {
@@ -222,9 +266,11 @@ Structure optimized for AI analysis:
 
 ### Processing Settings
 Modify these in `video_processor.py`:
-- `PLAYER_CONFIDENCE_THRESHOLD`: 0.5 (minimum confidence for player detection)
+- `PLAYER_CONFIDENCE_THRESHOLD`: 0.5 (minimum confidence for player detection)  
 - `BALL_CONFIDENCE_THRESHOLD`: 0.3 (minimum confidence for ball detection)
 - `BEV_RESOLUTION`: (800, 600) (Bird's Eye View output size)
+- `DEEPSORT_MAX_AGE`: 30 (frames to keep tracks without detection)
+- `DEEPSORT_N_INIT`: 3 (confirmations needed before track activation)
 
 ## 🚀 Advanced Usage
 
@@ -272,8 +318,9 @@ def _detect_custom_event(self, player_id, x, y, timestamp, frame_number):
 
 ```
 trackingStudio/
-├── main.py                 # FastAPI application
+├── main.py                 # FastAPI application  
 ├── video_processor.py      # Video analysis pipeline
+├── deepsort_tracker.py     # DeepSORT tracking implementation
 ├── run.py                 # Server startup script
 ├── client_example.py      # Example API client
 ├── requirements.txt       # Python dependencies
@@ -324,11 +371,18 @@ trackingStudio/
 - Improve lighting in source videos
 - Ensure basketball court is clearly visible
 - Consider adjusting confidence thresholds
+- YOLO11 medium model requires more GPU memory
 
-**4. "Memory issues during processing"**
-- Reduce video resolution if possible
+**4. "Memory issues during processing"**  
+- YOLO11 medium model uses more memory than nano
+- Consider using YOLO11 small model if needed
 - Process shorter video segments
-- Monitor system RAM usage
+- Monitor system RAM and GPU usage
+
+**5. "Player ID switching (less common now with DeepSORT)"**
+- DeepSORT should maintain consistent IDs through occlusions
+- If still occurring, adjust `max_cosine_distance` parameter
+- Ensure good video quality for appearance matching
 
 ### Performance Optimization
 
