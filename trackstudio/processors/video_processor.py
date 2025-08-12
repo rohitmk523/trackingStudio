@@ -6,7 +6,9 @@ from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 from ultralytics import YOLO
 import logging
-from deepsort_tracker import BasketballDeepSortTracker
+from .deepsort_tracker import BasketballDeepSortTracker
+from .cross_camera_merger import CrossCameraMerger
+from ..utils.shot_detector import ShotDetector
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -43,17 +45,17 @@ class VideoProcessor:
         # Initialize YOLO model using latest ultralytics approach
         # Use YOLO11 medium model for better accuracy
         try:
-            self.model = YOLO('yolo11m.pt')  # YOLO11 medium - better accuracy
+            self.model = YOLO('../models/yolo11m.pt')  # YOLO11 medium - better accuracy
             logger.info("Loaded YOLO11 medium model successfully")
         except Exception as e:
             logger.warning(f"Failed to load YOLO11 medium, trying smaller models: {e}")
             try:
-                self.model = YOLO('yolo11s.pt')  # Fallback to small
+                self.model = YOLO('../models/yolo11n.pt')  # Fallback to nano
                 logger.info("Loaded YOLO11 small model successfully")
             except Exception as e2:
                 logger.warning(f"Failed to load YOLO11 small, trying YOLOv8: {e2}")
                 try:
-                    self.model = YOLO('yolov8m.pt')  # YOLOv8 medium fallback
+                    self.model = YOLO('../models/yolov8n.pt')  # YOLOv8 nano fallback
                     logger.info("Loaded YOLOv8 medium model successfully")
                 except Exception as e3:
                     logger.error(f"Failed to load any YOLO model: {e3}")
@@ -75,6 +77,17 @@ class VideoProcessor:
         # Initialize DeepSORT trackers for both cameras
         self.tracker_camera1 = BasketballDeepSortTracker(max_age=30, n_init=3)
         self.tracker_camera2 = BasketballDeepSortTracker(max_age=30, n_init=3)
+        
+        # Initialize Cross-Camera Merger for unified player IDs (optimized for overlapping views)
+        self.cross_camera_merger = CrossCameraMerger(
+            max_player_distance_bev=1.5,  # 1.5m max distance for overlapping camera views
+            appearance_similarity_threshold=0.5,  # Lower threshold for different angles
+            max_frames_missing=60  # 2 seconds at 30fps for overlapping coverage
+        )
+        
+        # Initialize Shot Detectors for both cameras
+        self.shot_detector_camera1 = ShotDetector()
+        self.shot_detector_camera2 = ShotDetector()
         
     async def process_dual_videos(self, video1_path: str, video2_path: str, court_points: dict = None) -> Tuple[str, str]:
         """Main dual camera video processing pipeline with BEV transformation."""
@@ -143,12 +156,28 @@ class VideoProcessor:
                 if not ret1 or not ret2:
                     break
                 
-                # Process both frames
-                annotated_frame1 = await self._process_frame(
+                # Process both frames individually with DeepSORT
+                tracked_objects1 = await self._process_frame_for_tracking(
                     frame1, frame_number, fps, camera_id=1
                 )
-                annotated_frame2 = await self._process_frame(
+                tracked_objects2 = await self._process_frame_for_tracking(
                     frame2, frame_number, fps, camera_id=2
+                )
+                
+                # Perform cross-camera merging to get global player IDs
+                global_players = self.cross_camera_merger.merge_camera_detections(
+                    tracked_objects1, tracked_objects2, frame_number, frame_number / fps,
+                    self.homography_matrix_1, self.homography_matrix_2
+                )
+                
+                # Create annotated frames with global player information
+                annotated_frame1 = self._create_annotated_frame(frame1, tracked_objects1, global_players, camera_id=1)
+                annotated_frame2 = self._create_annotated_frame(frame2, tracked_objects2, global_players, camera_id=2)
+                
+                # Detect basketball events using global player information
+                timestamp = frame_number / fps
+                self._detect_basketball_events_with_global_players(
+                    global_players, tracked_objects1 + tracked_objects2, timestamp, frame_number
                 )
                 
                 # Create combined side-by-side view
@@ -156,9 +185,9 @@ class VideoProcessor:
                     annotated_frame1, annotated_frame2, combined_width, combined_height
                 )
                 
-                # Create BEV frame if homography is available
-                bev_frame = self._create_bev_frame(
-                    frame1, frame2, bev_width, bev_height, frame_number, fps
+                # Create enhanced BEV frame with global player information
+                bev_frame = self._create_enhanced_bev_frame(
+                    frame1, frame2, bev_width, bev_height, frame_number, fps, global_players
                 )
                 
                 # Write frames
@@ -192,6 +221,250 @@ class VideoProcessor:
             logger.error(f"Error processing video: {str(e)}")
             self._update_status("failed", 0.0, f"Processing failed: {str(e)}")
             raise
+    
+    async def _process_frame_for_tracking(self, frame: np.ndarray, frame_number: int, fps: int, camera_id: int = 1) -> List[Dict]:
+        """Process a single frame for object detection and tracking, returning tracked objects."""
+        
+        timestamp = frame_number / fps
+        
+        # Run YOLO detection
+        results = self.model(frame, verbose=False)
+        
+        # Convert YOLO results to detection format for DeepSORT
+        detections = []
+        for result in results:
+            boxes = result.boxes
+            if boxes is not None:
+                for box in boxes:
+                    conf = float(box.conf[0])
+                    cls = int(box.cls[0])
+                    class_name = self.model.names[cls]
+                    
+                    # Filter detections by confidence and include potential hoop objects
+                    if ((class_name == 'person' and conf > 0.5) or 
+                        (class_name == 'sports ball' and conf > 0.3) or
+                        (conf > 0.4 and class_name in ['frisbee', 'umbrella', 'kite', 'chair'])):  # Potential hoop objects
+                        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                        
+                        detections.append({
+                            'bbox': [x1, y1, x2, y2],
+                            'confidence': conf,
+                            'class_id': cls,
+                            'class_name': class_name
+                        })
+        
+        # Update DeepSORT tracker
+        tracker = self.tracker_camera1 if camera_id == 1 else self.tracker_camera2
+        tracked_objects = tracker.update_tracks(detections, frame, frame_number, timestamp, camera_id)
+        
+        # Process shot detection
+        shot_detector = self.shot_detector_camera1 if camera_id == 1 else self.shot_detector_camera2
+        
+        # Extract ball detection and potential hoop detections for shot analysis
+        ball_detection = None
+        hoop_detections = []
+        
+        for detection in detections:
+            if detection['class_name'] == 'sports ball':
+                ball_detection = {
+                    'center': ((detection['bbox'][0] + detection['bbox'][2]) / 2, 
+                             (detection['bbox'][1] + detection['bbox'][3]) / 2),
+                    'confidence': detection['confidence'],
+                    'size': (detection['bbox'][2] - detection['bbox'][0], 
+                           detection['bbox'][3] - detection['bbox'][1])
+                }
+            elif detection['class_name'] in ['frisbee', 'umbrella', 'kite', 'chair']:
+                # Potential hoop detection
+                hoop_detections.append({
+                    'center': ((detection['bbox'][0] + detection['bbox'][2]) / 2, 
+                             (detection['bbox'][1] + detection['bbox'][3]) / 2),
+                    'confidence': detection['confidence'],
+                    'size': (detection['bbox'][2] - detection['bbox'][0], 
+                           detection['bbox'][3] - detection['bbox'][1])
+                })
+        
+        # Process frame for shot detection
+        shot_event = shot_detector.process_frame(
+            frame, ball_detection, hoop_detections, frame_number, timestamp
+        )
+        
+        # Store shot event if detected
+        if shot_event:
+            self.events.append(BasketballEvent(
+                event_type="shot_made" if shot_event.is_made else "shot_missed",
+                timestamp=shot_event.timestamp,
+                frame_number=shot_event.frame_number,
+                position=shot_event.position,
+                confidence=shot_event.confidence
+            ))
+            logger.info(f"Shot {'MADE' if shot_event.is_made else 'MISSED'} detected at {timestamp:.2f}s")
+        
+        return tracked_objects
+    
+    def _create_annotated_frame(self, frame: np.ndarray, tracked_objects: List[Dict], 
+                               global_players: List, camera_id: int) -> np.ndarray:
+        """Create annotated frame with global player IDs."""
+        
+        annotated_frame = frame.copy()
+        
+        # Create mapping from local to global IDs
+        local_to_global = {}
+        for global_player in global_players:
+            if camera_id in global_player.camera_detections:
+                detection = global_player.camera_detections[camera_id]
+                local_to_global[detection.local_player_id] = global_player.global_id
+        
+        # Draw annotations
+        for obj in tracked_objects:
+            bbox = obj['bbox']
+            player_id = obj['player_id']
+            color = obj['color']
+            
+            # Use global ID if available
+            display_id = local_to_global.get(player_id, player_id)
+            
+            # Draw bounding box
+            x1, y1, x2, y2 = map(int, bbox)
+            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
+            
+            # Draw player ID (global if available)
+            if display_id.startswith('GlobalPlayer_'):
+                label = f"GP_{display_id.split('_')[-1]}"  # Shorten global ID
+            else:
+                label = player_id
+            
+            label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)[0]
+            cv2.rectangle(annotated_frame, (x1, y1 - label_size[1] - 10), 
+                         (x1 + label_size[0], y1), color, -1)
+            cv2.putText(annotated_frame, label, (x1, y1 - 5), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+        
+        # Add camera label
+        cv2.putText(annotated_frame, f'Camera {camera_id}', 
+                   (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        
+        return annotated_frame
+    
+    def _detect_basketball_events_with_global_players(self, global_players: List, 
+                                                     all_tracked_objects: List[Dict],
+                                                     timestamp: float, frame_number: int):
+        """Detect basketball events using global player information for more accurate attribution."""
+        
+        # Find ball objects
+        ball_objects = [obj for obj in all_tracked_objects if obj.get('class_name') == 'sports ball']
+        
+        if not ball_objects:
+            return
+        
+        # Use the most confident ball detection
+        ball_obj = max(ball_objects, key=lambda x: x['confidence'])
+        ball_center = ball_obj['center']
+        
+        # Update ball tracking
+        self.last_ball_position = ball_center
+        self.ball_tracks[frame_number] = {
+            'timestamp': timestamp,
+            'position': ball_center,
+            'confidence': ball_obj['confidence']
+        }
+        
+        # Find closest global player to ball in BEV space
+        closest_global_player = None
+        min_distance = float('inf')
+        
+        for global_player in global_players:
+            # Get the most recent BEV position
+            recent_position = global_player.get_average_bev_position()
+            if recent_position != (0.0, 0.0):
+                # For ball, use any available homography to get BEV position
+                ball_bev_pos = None
+                
+                # Try to get ball BEV position using available homography
+                if hasattr(self, 'homography_matrix_1') and self.homography_matrix_1 is not None:
+                    ball_bev_pos = self._transform_to_bev_coordinates_new(
+                        ball_center[0], ball_center[1], self.homography_matrix_1
+                    )
+                elif hasattr(self, 'homography_matrix_2') and self.homography_matrix_2 is not None:
+                    ball_bev_pos = self._transform_to_bev_coordinates_new(
+                        ball_center[0], ball_center[1], self.homography_matrix_2
+                    )
+                
+                if ball_bev_pos:
+                    distance = np.sqrt(
+                        (ball_bev_pos[0] - recent_position[0])**2 + 
+                        (ball_bev_pos[1] - recent_position[1])**2
+                    )
+                    
+                    if distance < min_distance:
+                        min_distance = distance
+                        closest_global_player = global_player
+        
+        # Detect possession and events
+        if closest_global_player and min_distance < 2.0:  # 2 meters threshold in BEV
+            current_possessor = closest_global_player.global_id
+            
+            # Check for possession change (assist detection)
+            if current_possessor != self.possession_player and self.possession_player:
+                assist_event = BasketballEvent(
+                    "assist", timestamp, frame_number,
+                    self.possession_player, ball_center, 0.6
+                )
+                self.events.append(assist_event)
+                logger.info(f"Assist detected: {self.possession_player} -> {current_possessor}")
+            
+            self.possession_player = current_possessor
+            
+            # Check for shot attempts based on BEV position
+            player_bev_pos = closest_global_player.get_average_bev_position()
+            if player_bev_pos != (0.0, 0.0):
+                if self._is_shot_attempt_bev(player_bev_pos[0], player_bev_pos[1]):
+                    if self._is_three_point_shot_bev(player_bev_pos[0], player_bev_pos[1]):
+                        shot_event = BasketballEvent(
+                            "3_point_attempt", timestamp, frame_number,
+                            current_possessor, ball_center, 0.7
+                        )
+                        self.events.append(shot_event)
+                        logger.info(f"3-point attempt: {current_possessor}")
+                    else:
+                        shot_event = BasketballEvent(
+                            "2_point_attempt", timestamp, frame_number,
+                            current_possessor, ball_center, 0.6
+                        )
+                        self.events.append(shot_event)
+                        logger.info(f"2-point attempt: {current_possessor}")
+    
+    def _transform_to_bev_coordinates_new(self, x: float, y: float, homography_matrix: np.ndarray) -> Optional[Tuple[float, float]]:
+        """Transform image coordinates to BEV coordinates."""
+        try:
+            point = np.array([[x, y]], dtype=np.float32)
+            transformed = cv2.perspectiveTransform(point.reshape(1, 1, 2), homography_matrix)
+            return tuple(transformed[0][0])
+        except:
+            return None
+    
+    def _is_shot_attempt_bev(self, bev_x: float, bev_y: float) -> bool:
+        """Check if position indicates a shot attempt in BEV coordinates."""
+        court_length_m = self.court_length * 0.3048
+        court_width_m = self.court_width * 0.3048
+        
+        # Distance from both baskets (assuming baskets at ends of court)
+        dist_to_basket1 = np.sqrt(bev_x**2 + (bev_y - court_width_m/2)**2)
+        dist_to_basket2 = np.sqrt((bev_x - court_length_m)**2 + (bev_y - court_width_m/2)**2)
+        
+        min_dist_to_basket = min(dist_to_basket1, dist_to_basket2)
+        return min_dist_to_basket < 8.0  # Within 8 meters of basket
+    
+    def _is_three_point_shot_bev(self, bev_x: float, bev_y: float) -> bool:
+        """Check if position is 3-point range in BEV coordinates."""
+        court_length_m = self.court_length * 0.3048
+        court_width_m = self.court_width * 0.3048
+        
+        # Distance from both baskets
+        dist_to_basket1 = np.sqrt(bev_x**2 + (bev_y - court_width_m/2)**2)
+        dist_to_basket2 = np.sqrt((bev_x - court_length_m)**2 + (bev_y - court_width_m/2)**2)
+        
+        min_dist_to_basket = min(dist_to_basket1, dist_to_basket2)
+        return min_dist_to_basket > 6.7  # Beyond 3-point line (approximately 6.7m)
     
     async def _process_frame(self, frame: np.ndarray, frame_number: int, fps: int, camera_id: int = 1) -> np.ndarray:
         """Process a single frame for object detection and tracking with DeepSORT."""
@@ -512,10 +785,17 @@ class VideoProcessor:
             },
             "events": [event.to_dict() for event in self.events],
             "player_tracks": self._compile_all_player_tracks(),
+            "global_player_tracks": self.cross_camera_merger.get_merged_player_tracks(),
+            "cross_camera_statistics": self.cross_camera_merger.get_statistics(),
             "statistics": {
                 "total_players_detected": len(self._compile_all_player_tracks()),
                 "total_events": len(self.events),
                 "event_breakdown": self._get_event_breakdown()
+            },
+            "shot_statistics": {
+                "camera1": self.shot_detector_camera1.get_shot_statistics(),
+                "camera2": self.shot_detector_camera2.get_shot_statistics(),
+                "combined": self._get_combined_shot_statistics()
             }
         }
         
@@ -532,6 +812,28 @@ class VideoProcessor:
             event_type = event.event_type
             breakdown[event_type] = breakdown.get(event_type, 0) + 1
         return breakdown
+    
+    def _get_combined_shot_statistics(self) -> Dict:
+        """Get combined shot statistics from both cameras."""
+        camera1_stats = self.shot_detector_camera1.get_shot_statistics()
+        camera2_stats = self.shot_detector_camera2.get_shot_statistics()
+        
+        # Combine statistics
+        total_shots = camera1_stats["total_shots"] + camera2_stats["total_shots"]
+        total_made = camera1_stats["shots_made"] + camera2_stats["shots_made"]
+        total_missed = camera1_stats["shots_missed"] + camera2_stats["shots_missed"]
+        
+        # Combine shot events from both cameras and sort by timestamp
+        all_shot_events = camera1_stats["shot_events"] + camera2_stats["shot_events"]
+        all_shot_events.sort(key=lambda x: x["timestamp"])
+        
+        return {
+            "total_shots": total_shots,
+            "shots_made": total_made,
+            "shots_missed": total_missed,
+            "shooting_percentage": (total_made / max(1, total_shots)) * 100,
+            "shot_timeline": all_shot_events
+        }
     
     def _update_status(self, status: str, progress: float, message: str):
         """Update processing status."""
@@ -677,6 +979,34 @@ class VideoProcessor:
                             bev_x, bev_y = bev_point
                             # Draw ball as small filled circle
                             cv2.circle(bev_frame, (int(bev_x), int(bev_y)), 5, (0, 255, 255), -1)
+        
+        return bev_frame
+    
+    def _create_enhanced_bev_frame(self, frame1: np.ndarray, frame2: np.ndarray, 
+                                  bev_width: int, bev_height: int, 
+                                  frame_number: int, fps: int, global_players: List) -> np.ndarray:
+        """Create enhanced Bird's Eye View frame with global player tracking."""
+        
+        # Create blank BEV frame (basketball court background)
+        bev_frame = np.zeros((bev_height, bev_width, 3), dtype=np.uint8)
+        
+        # Draw basketball court outline
+        bev_frame = self._draw_court_outline(bev_frame, bev_width, bev_height)
+        
+        # Use cross-camera merger to visualize global tracks
+        bev_frame = self.cross_camera_merger.visualize_global_tracks_bev(bev_frame)
+        
+        # Add merger statistics
+        stats = self.cross_camera_merger.get_statistics()
+        cv2.putText(bev_frame, f'Global Players: {stats["active_global_players"]}', 
+                   (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(bev_frame, f'Associations: {stats["total_associations"]}', 
+                   (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
+        # Add timestamp
+        timestamp = frame_number / fps
+        cv2.putText(bev_frame, f'BEV Time: {timestamp:.2f}s', 
+                   (10, bev_height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         
         return bev_frame
     

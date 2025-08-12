@@ -4,7 +4,8 @@ import uvicorn
 import sys
 import os
 
-if __name__ == "__main__":
+def main():
+    """Main entry point for the TrackStudio server."""
     # Create required directories
     os.makedirs("uploads", exist_ok=True)
     os.makedirs("outputs", exist_ok=True)
@@ -18,7 +19,7 @@ if __name__ == "__main__":
     
     try:
         uvicorn.run(
-            "main:app", 
+            "trackstudio.api.main:app", 
             host="0.0.0.0", 
             port=8000, 
             reload=True,
@@ -27,3 +28,6 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\n🛑 Server stopped by user")
         sys.exit(0)
+
+if __name__ == "__main__":
+    main()

@@ -69,7 +69,7 @@ class BasketballDeepSortTracker:
             camera_id: Camera identifier
             
         Returns:
-            List of tracked objects with IDs
+            List of tracked objects with IDs and appearance embeddings
         """
         
         if not detections:
@@ -161,6 +161,17 @@ class BasketballDeepSortTracker:
                     if len(self.player_tracks[player_id]) > 300:
                         self.player_tracks[player_id] = self.player_tracks[player_id][-300:]
                     
+                    # Extract appearance embedding if available
+                    appearance_embedding = None
+                    try:
+                        if hasattr(track, 'last_feature') and track.last_feature is not None:
+                            appearance_embedding = track.last_feature.copy()
+                        elif hasattr(track, 'features') and track.features:
+                            # Use the most recent feature
+                            appearance_embedding = track.features[-1].copy()
+                    except Exception as e:
+                        logger.debug(f"Could not extract appearance embedding: {e}")
+                    
                     tracked_objects.append({
                         'player_id': player_id,
                         'track_id': track_id,
@@ -168,7 +179,8 @@ class BasketballDeepSortTracker:
                         'center': (center_x, center_y),
                         'confidence': confidence,
                         'class_name': class_name,
-                        'color': self.track_colors[track_id]
+                        'color': self.track_colors[track_id],
+                        'appearance_embedding': appearance_embedding
                     })
                 
                 elif class_name == 'sports ball':

@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 from pathlib import Path
 from pydantic import BaseModel
-from video_processor import VideoProcessor
+from ..processors.video_processor import VideoProcessor
 
 app = FastAPI(title="Basketball Video Analysis API", version="1.0.0")
 
